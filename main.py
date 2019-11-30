@@ -20,6 +20,9 @@ import ast
 import math
 from copy import deepcopy
 
+DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+CPU = torch.device('cpu')
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -114,10 +117,11 @@ def train_epoch(model, data_loaders, lr, s, sync_mode="sync",
                 # Try to fetch the next batch on this machine:
                 try:
                     xs, ys = next(data_loader_it)
+                    xs, ys = xs.to(DEVICE), ys.to(DEVICE)
                 except StopIteration:
                     done += 1
                     # append empty message from that node
-                    zero_message = {k: torch.tensor(0.0) for k in model.state_dict().keys()}
+                    zero_message = {k: torch.tensor(0.0, device=DEVICE) for k in model.state_dict().keys()}
                     all_grads.append(zero_message)
                     # don't update all_loss to not screw up averaging
                     continue
@@ -125,7 +129,8 @@ def train_epoch(model, data_loaders, lr, s, sync_mode="sync",
                 loss = nn.CrossEntropyLoss()(logits, ys)
                 model.zero_grad()
                 loss.backward()
-                all_grads.append(model.get_gradients())
+                gradient = model.get_gradients()
+                all_grads.append(gradient)
                 all_losses.append(loss.item())
 
                 ############ for per-epoch update ############
@@ -137,12 +142,12 @@ def train_epoch(model, data_loaders, lr, s, sync_mode="sync",
                 # # now gradients_m has gradients computed on machine m
                 # all_grads.append(gradients_m)
                 ###############################################
-            
+
             # In synchronous regime, apply the update after all gradients are computed (*after every round of batches*)
             new_state_dict = deepcopy(model.state_dict())
             agg_grad = aggregate_gradients(all_grads, s, agg_args)
             new_state_dict = add_dicts(new_state_dict, agg_grad, weight=-lr)  # step against the gradient
-            model.set_weights(new_state_dict)
+            model.set_weights(new_state_dict)  # everything should live on the same device
         return np.mean(all_losses)  # per batch
 
     # Otherwise, make an update after every gradient computation
@@ -173,6 +178,7 @@ if __name__ == "__main__":
     test_data_loaders = get_data_loaders_per_machine(args.dataset, "test", args.n_workers, args.batch_size)
 
     model = QuantizedLeNet()
+    model.to(DEVICE)
 
     # Parse quant levels
     s = ast.literal_eval(args.quant_levels)  # int or list[int]
