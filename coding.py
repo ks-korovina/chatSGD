@@ -5,6 +5,8 @@ Quantization utilities.
 import numpy as np
 import torch
 
+EPS = 1e-10
+
 
 def uniform_encode(v, s):
     """
@@ -16,14 +18,15 @@ def uniform_encode(v, s):
         v - tensor
         s - number of quantization levels, int (>= 2)
     """
+    # NOTE: referencing torch.cuda.FloatTensor fails if torch wasn't compiled with CUDA enabled
     if isinstance(v, (torch.Tensor, torch.cuda.FloatTensor)):
         w = v.cpu().numpy()
     elif isinstance(v, np.ndarray):
         w = v
     else:
-        raise ValueError("Object passed to encode not ndarray or torch.Tensor")
+        raise ValueError(f"Object {type(v)} passed to encode not ndarray or torch.Tensor")
 
-    norm = np.linalg.norm(v)
+    norm = max(np.linalg.norm(v), EPS)
     signs = np.sign(w).astype('int')
     probs = np.abs(w) / norm
 
@@ -33,7 +36,7 @@ def uniform_encode(v, s):
     # Now compute a mask by stochastically deciding 
     # whether to add an add-on to floor (making it ceil):
     remainders = (scaled_probs - floors)
-    assert (np.all(remainders < 1) and np.all(remainders > 0))
+    assert (np.all(remainders < 1+EPS) and np.all(remainders > -EPS)), v
     mask = np.random.rand(*remainders.shape) < remainders  # bools
     code_bins = floors + mask
 
@@ -55,12 +58,15 @@ def uniform_decode(code, s, device=torch.device("cpu")):
 
 def uniform_reconstruct(grad_dict, s):
     def on_vector(v, s):
-        if isinstance(v, torch.cuda.FloatTensor):
-            device = torch.device("cuda")
-        else:
-            device = torch.device("cpu")
+        # zero message sending simulated
+        if np.abs(np.linalg.norm(v)) < EPS:
+            return v
+        device = torch.device("cpu")
+        if v.is_cuda:
+            device = v.get_device()
         code = uniform_encode(v, s=s)
         dec = uniform_decode(code, s=s, device=device)
+        # Check that zero messages remain zero
         return dec
     dec = {k: 0.0 for k in grad_dict.keys()}
     for k in grad_dict:

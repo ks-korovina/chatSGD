@@ -1,5 +1,9 @@
 """
-Runner script
+Runner script.
+Workers communicate quantized gradients with specified level of quantization after every batch round.
+
+TODO:
+* add GPU training (transfers to device)
 """
 
 from datasets import get_data_loaders_per_machine
@@ -9,6 +13,7 @@ from coding import uniform_reconstruct
 import torch
 import torch.optim as optim
 import torch.nn as nn
+import numpy as np
 
 import argparse
 import ast
@@ -16,14 +21,15 @@ import math
 from copy import deepcopy
 
 
-def parse_train_args():
+def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, help='model to use')
-    parser.add_argument('--dataset', type=str, help='dataset to use')
+    parser.add_argument('--model', default="lenet", type=str, help='model to use')
+    parser.add_argument('--dataset', default="mnist", type=str, help='dataset to use')
 
     # Key experimental parameters
     parser.add_argument('--n_workers', default=1, type=int, help='number of workers')
-    parser.add_argument('--quant_levels', default="10", type=str, help='number of quantization levels, either an int or list[int] in str format')
+    parser.add_argument('--quant_levels', default="10000", type=str,
+        help='number of quantization levels, either an int or list[int] in str format; log2(2*s)=num of bits')
 
     # Training settings
     parser.add_argument('--batch_size', default=100, type=int, help='batch size')
@@ -31,7 +37,7 @@ def parse_train_args():
     parser.add_argument('--n_epochs', default=15, type=int, help='number of training epochs')
 
     # Evaluation settings
-    parser.add_argument('--eval_freq', default=10, type=int, help='evaluate every `x` epochs')
+    parser.add_argument('--eval_freq', default=1, type=int, help='evaluate every `x` epochs')
     parser.add_argument('--verbose', default=False, type=bool, help='whether to display training statistics')
     
     args = parser.parse_args()
@@ -40,7 +46,7 @@ def parse_train_args():
 
 def add_dicts(d, add_d, weight=1.0):
     for key in add_d:
-        d[key] += weight * add_d[k]
+        d[key] += weight * add_d[key]
     return d
 
 
@@ -48,7 +54,7 @@ def aggregate_gradients(all_grads, s, agg_args):
     agg_grads = {k: 0.0 for k in all_grads[0].keys()}
     if agg_args["mode"] == "simple":
         for m, grad in enumerate(all_grads):
-            quantized_grad = uniform_reconstruct(grad, s[m])
+            quantized_grad = uniform_reconstruct(grad, s if isinstance(s, int) else s[m])
             agg_grads = add_dicts(agg_grads, quantized_grad)
         return agg_grads
     elif agg_args["mode"] == "grouped":
@@ -82,7 +88,7 @@ def train_epoch(model, data_loaders, lr, s, sync_mode="sync",
         s {int or list[int]} -- quantization levels per machine
         sync_mode
     Returns:
-        loss
+        average per-batch loss
 
     Particular settings:
 
@@ -90,47 +96,81 @@ def train_epoch(model, data_loaders, lr, s, sync_mode="sync",
 
     Experiment 2. Use different values in list s, leave default agg_args
 
+    NOTE: if we update once an epoch, it is actually too slow to converge -- doesn't work!
+
     """
     assert sync_mode in ("sync", "async")
     n_workers = len(data_loaders)
+    model.train()
 
     # If async, get all gradients and then make an update
     if sync_mode == "sync":
-        all_grads = []
-        for m_id, data_loader in enumerate(data_loaders):
-            gradients_m = {k: 0.0 for k in new_state_dict.keys()}
-            for xs, ys in data_loader:
+        all_losses = []
+        done = 0  # number of workers that have gone through their dataset
+        iterators = [iter(data_loader) for data_loader in data_loaders]
+        while done < len(data_loaders):
+            all_grads = []  # PER-BATCH gradients from m workers
+            for m_id, data_loader_it in enumerate(iterators):
+                # Try to fetch the next batch on this machine:
+                try:
+                    xs, ys = next(data_loader_it)
+                except StopIteration:
+                    done += 1
+                    # append empty message from that node
+                    zero_message = {k: torch.tensor(0.0) for k in model.state_dict().keys()}
+                    all_grads.append(zero_message)
+                    # don't update all_loss to not screw up averaging
+                    continue
                 logits = model(xs)
                 loss = nn.CrossEntropyLoss()(logits, ys)
                 model.zero_grad()
                 loss.backward()
-                grads = model.get_gradients()
-                gradients_m = add_dicts(gradients_m, grads)
-            # now gradients_m has gradients computed on machine m
-            all_grads.append(gradients_m)
-        # In synchronous regime, apply the update after all gradients are computed
-        new_state_dict = deepcopy(model.state_dict())
-        agg_grad = aggregate_gradients(all_grads, s, agg_args)
-        new_state_dict = add_dicts(new_state_dict, agg_grad, weight=-lr)
-        model.set_weights(new_state_dict)
+                all_grads.append(model.get_gradients())
+                all_losses.append(loss.item())
+
+                ############ for per-epoch update ############
+                # gradients_m = {k: 0.0 for k in model.state_dict().keys()}
+                # [... looping over all (xs,ys) batches of local data and putting gradients into gradients_m ...]
+                # grads = model.get_gradients() 
+                # gradients_m = add_dicts(gradients_m, grads)
+                # all_losses.append(loss.item())
+                # # now gradients_m has gradients computed on machine m
+                # all_grads.append(gradients_m)
+                ###############################################
+            
+            # In synchronous regime, apply the update after all gradients are computed (*after every round of batches*)
+            new_state_dict = deepcopy(model.state_dict())
+            agg_grad = aggregate_gradients(all_grads, s, agg_args)
+            new_state_dict = add_dicts(new_state_dict, agg_grad, weight=-lr)  # step against the gradient
+            model.set_weights(new_state_dict)
+        return np.mean(all_losses)  # per batch
 
     # Otherwise, make an update after every gradient computation
     elif sync_mode == "async":
         # TODO
         pass
-    return None
+
+    else:
+        raise ValueError(f"Invalid argument sync_mode={sync_mode}")
 
 
-def evaluate(model, data_loaders):
-    pass
+def evaluate(model, data_loader):
+    model.eval()
+    accs = []
+    for (xs, ys) in data_loader:
+        logits = model(xs)
+        y_pred = logits.argmax(dim=1)
+        batch_acc = (y_pred == ys).float().mean().item()
+        accs.append(batch_acc)
+    print("Validation accuracy: {:.3f}".format(np.mean(accs)))
 
 
 if __name__ == "__main__":
     args = parse_args()
 
     train_data_loaders = get_data_loaders_per_machine(args.dataset, "train", args.n_workers, args.batch_size)
-    eval_data_loaderst = get_data_loaders_per_machine(args.dataset, "val", args.n_workers, args.batch_size)
-    test_data_loaderst = get_data_loaders_per_machine(args.dataset, "test", args.n_workers, args.batch_size)
+    eval_data_loaders = get_data_loaders_per_machine(args.dataset, "val", args.n_workers, args.batch_size)
+    test_data_loaders = get_data_loaders_per_machine(args.dataset, "test", args.n_workers, args.batch_size)
 
     model = QuantizedLeNet()
 
@@ -139,10 +179,13 @@ if __name__ == "__main__":
     # TODO: add args parameters for agg_args
 
     curr_lr = args.lr  # TODO: this may need tuning and lr decay
+    # opt = optim.SGD(model.parameters(), curr_lr)
 
     for epoch in range(args.n_epochs):
-        train_epoch(model, train_data_loaders, curr_lr, s)
+        loss = train_epoch(model, train_data_loaders, curr_lr, s)
+        print(f"Loss: {loss}")
         if epoch % args.eval_freq == 0:
+            model.eval()
             evaluate(model, eval_data_loaders)
 
     # test
