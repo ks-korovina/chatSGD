@@ -53,6 +53,21 @@ def uniform_decode(code, s, device=torch.device("cpu")):
     return v
 
 
+def uniform_reconstruct(grad_dict, s):
+    def on_vector(v, s):
+        if isinstance(v, torch.cuda.FloatTensor):
+            device = torch.device("cuda")
+        else:
+            device = torch.device("cpu")
+        code = uniform_encode(v, s=s)
+        dec = uniform_decode(code, s=s, device=device)
+        return dec
+    dec = {k: 0.0 for k in grad_dict.keys()}
+    for k in grad_dict:
+        dec[k] = on_vector(grad_dict[k], s)
+    return dec
+
+
 def test_uniform_code():
     """Not worth proper unittesting"""
     for shape in ((1, 3, 1), (20,), (10, 20, 30)):
