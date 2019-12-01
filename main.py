@@ -49,6 +49,8 @@ def parse_args():
 
 def add_dicts(d, add_d, weight=1.0):
     for key in add_d:
+        if isinstance(d[key], torch.LongTensor):
+            continue
         d[key] += weight * add_d[key]
     return d
 
@@ -115,17 +117,19 @@ def train_epoch(model, data_loaders, lr, s, sync_mode="sync",
     # If async, get all gradients and then make an update
     if sync_mode == "sync":
         all_losses = []
-        done = 0  # number of workers that have gone through their dataset
         iterators = [iter(data_loader) for data_loader in data_loaders]
-        while done < len(data_loaders):
+        done = [False] * len(iterators)
+        while not all(done):
             all_grads = []  # PER-BATCH gradients from m workers
             for m_id, data_loader_it in enumerate(iterators):
-                # Try to fetch the next batch on this machine:
-                try:
-                    xs, ys = next(data_loader_it)
-                    xs, ys = xs.to(DEVICE), ys.to(DEVICE)
-                except StopIteration:
-                    done += 1
+                if not done[m_id]:
+                    # Try to fetch the next batch on this machine:
+                    try:
+                        xs, ys = next(data_loader_it)
+                        xs, ys = xs.to(DEVICE), ys.to(DEVICE)
+                    except StopIteration:
+                        done[m_id] = True
+                if done[m_id]:  # either previously was done, or set just now
                     # append empty message from that node
                     zero_message = {k: torch.tensor(0.0, device=DEVICE) for k in model.state_dict().keys()}
                     all_grads.append(zero_message)
