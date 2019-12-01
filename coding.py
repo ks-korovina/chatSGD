@@ -59,13 +59,14 @@ def uniform_decode(code, s, device=torch.device("cpu")):
 def uniform_reconstruct(grad_dict, s):
     def on_vector(v, s):
         # zero message sending simulated
-        if np.abs(np.linalg.norm(v)) < EPS:
+        if np.abs(np.linalg.norm(v)) < 1e-100:
             return v
         device = torch.device("cpu")
         if v.is_cuda:
             device = v.get_device()
         code = uniform_encode(v, s=s)
         dec = uniform_decode(code, s=s, device=device)
+        # print(f"Error: {np.linalg.norm(v - dec)}")
         # Check that zero messages remain zero
         return dec
     dec = {k: 0.0 for k in grad_dict.keys()}

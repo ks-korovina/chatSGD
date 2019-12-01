@@ -7,7 +7,7 @@ TODO:
 """
 
 from datasets import get_data_loaders_per_machine
-from models import QuantizedLeNet
+from models import get_model
 from coding import uniform_reconstruct
 
 import torch
@@ -36,13 +36,13 @@ def parse_args():
 
     # Training settings
     parser.add_argument('--batch_size', default=100, type=int, help='batch size')
-    parser.add_argument('--lr', default=1e-2, type=float, help='learning rate')
+    parser.add_argument('--lr', default=1e-1, type=float, help='learning rate')
     parser.add_argument('--n_epochs', default=15, type=int, help='number of training epochs')
 
     # Evaluation settings
     parser.add_argument('--eval_freq', default=1, type=int, help='evaluate every `x` epochs')
     parser.add_argument('--verbose', default=False, type=bool, help='whether to display training statistics')
-    
+
     args = parser.parse_args()
     return args
 
@@ -55,25 +55,31 @@ def add_dicts(d, add_d, weight=1.0):
 
 def aggregate_gradients(all_grads, s, agg_args):
     agg_grads = {k: 0.0 for k in all_grads[0].keys()}
+    
     if agg_args["mode"] == "simple":
+        n_active_workers = len([g for g in all_grads if g is not None])
         for m, grad in enumerate(all_grads):
             quantized_grad = uniform_reconstruct(grad, s if isinstance(s, int) else s[m])
-            agg_grads = add_dicts(agg_grads, quantized_grad)
+            agg_grads = add_dicts(agg_grads, quantized_grad, weight=1/n_active_workers)
         return agg_grads
+    
     elif agg_args["mode"] == "grouped":
         s_prime = agg_args["in_group_quant"]
-        assert isinstance(int, s), "Outer quantization level must be an integer"
+        assert isinstance(s, int), "Outer quantization level must be an integer"
         assert s_prime >= s, "In-group allowed quantization level should be higher than out-group"
-        group_size = len(all_grads) // agg_args["n_groups"]
+        n_workers = len(all_grads)
+        group_size = math.ceil(len(all_grads) / agg_args["n_groups"])  # groups are chosen greedily
         for leader in range(0, n_workers, group_size):  # iterate over groups
             agg_grads_group = {k: 0.0 for k in all_grads[0].keys()}
             for m in range(leader, leader+group_size):
+                if m >= n_workers:
+                    break
                 # for each machine in group, quantize a little bit (simulate sending to leader):
                 quantized_grad = uniform_reconstruct(all_grads[m], s_prime)
-                agg_grads_group = add_dicts(agg_grads_group, quantized_grad)
+                agg_grads_group = add_dicts(agg_grads_group, quantized_grad, weight=1/group_size)
             # Simulate sending from the leader to the master node:
             agg_grads_group = uniform_reconstruct(agg_grads_group, s)
-            agg_grads = add_dicts(agg_grads, agg_grads_group)
+            agg_grads = add_dicts(agg_grads, agg_grads_group, weight=1/agg_args["n_groups"])
         return agg_grads
     else:
         raise ValueError(f"Not implemented mode {agg_args['mode']}")
@@ -132,6 +138,7 @@ def train_epoch(model, data_loaders, lr, s, sync_mode="sync",
                 gradient = model.get_gradients()
                 all_grads.append(gradient)
                 all_losses.append(loss.item())
+                # print(loss.item())
 
                 ############ for per-epoch update ############
                 # gradients_m = {k: 0.0 for k in model.state_dict().keys()}
@@ -177,18 +184,22 @@ if __name__ == "__main__":
     eval_data_loaders = get_data_loaders_per_machine(args.dataset, "val", args.n_workers, args.batch_size)
     test_data_loaders = get_data_loaders_per_machine(args.dataset, "test", args.n_workers, args.batch_size)
 
-    model = QuantizedLeNet()
+    model = get_model(args.model)
     model.to(DEVICE)
 
     # Parse quant levels
     s = ast.literal_eval(args.quant_levels)  # int or list[int]
-    # TODO: add args parameters for agg_args
+    # TODO: add args parameters for agg_args instead of this:
+    # agg_args_grouped = {
+    #     "mode": "grouped",
+    #     "n_groups": 3,
+    #     "in_group_quant": s * 2000
+    # }
 
     curr_lr = args.lr  # TODO: this may need tuning and lr decay
-    # opt = optim.SGD(model.parameters(), curr_lr)
 
     for epoch in range(args.n_epochs):
-        loss = train_epoch(model, train_data_loaders, curr_lr, s)
+        loss = train_epoch(model, train_data_loaders, curr_lr, s)  #, agg_args=agg_args_grouped)
         print(f"Loss: {loss}")
         if epoch % args.eval_freq == 0:
             model.eval()
