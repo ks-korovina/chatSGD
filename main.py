@@ -33,6 +33,8 @@ def parse_args():
     parser.add_argument('--n_workers', default=1, type=int, help='number of workers')
     parser.add_argument('--quant_levels', default="10000", type=str,
         help='number of quantization levels, either an int or list[int] in str format; log2(2*s)=num of bits')
+    parser.add_argument('--mode', default='simple', type=str,
+        help='gradient aggregation mode in our experiments, either simple or grouped')
 
     # Training settings
     parser.add_argument('--batch_size', default=100, type=int, help='batch size')
@@ -87,8 +89,7 @@ def aggregate_gradients(all_grads, s, agg_args):
         raise ValueError(f"Not implemented mode {agg_args['mode']}")
 
 
-def train_epoch(model, data_loaders, lr, s, sync_mode="sync",
-    agg_args={"mode": "simple", "n_groups": None, "in_group_quant": None}):
+def train_epoch(model, data_loaders, lr, s, agg_args, sync_mode="sync"):
     """
     Function simulating distributed training for one epoch.
 
@@ -193,17 +194,20 @@ if __name__ == "__main__":
 
     # Parse quant levels
     s = ast.literal_eval(args.quant_levels)  # int or list[int]
-    # TODO: add args parameters for agg_args instead of this:
-    # agg_args_grouped = {
-    #     "mode": "grouped",
-    #     "n_groups": 3,
-    #     "in_group_quant": s * 2000
-    # }
+
+    if args.mode == "simple":
+        agg_args = {"mode": "simple", "n_groups": None, "in_group_quant": None}
+    elif args.mode == "grouped":
+        agg_args = {
+            "mode": "grouped",
+            "n_groups": 3,
+            "in_group_quant": s * 2000
+        }
 
     curr_lr = args.lr  # TODO: this may need tuning and lr decay
 
     for epoch in range(args.n_epochs):
-        loss = train_epoch(model, train_data_loaders, curr_lr, s)  #, agg_args=agg_args_grouped)
+        loss = train_epoch(model, train_data_loaders, curr_lr, s, agg_args)
         print(f"Loss: {loss}")
         if epoch % args.eval_freq == 0:
             model.eval()
